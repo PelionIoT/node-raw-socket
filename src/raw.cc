@@ -6,6 +6,11 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h> 
+#include <net/if.h>
+#include <netinet/if_ether.h>
+#include <netpacket/packet.h>
+
 #include "raw.h"
 
 #ifdef _WIN32
@@ -235,9 +240,11 @@ Handle<Value> Ntohs (const Arguments& args) {
 void ExportConstants (Handle<Object> target) {
 	Local<Object> socket_level = Object::New ();
 	Local<Object> socket_option = Object::New ();
+	Local<Object> protocols = Object::New ();
 
 	target->Set (String::NewSymbol ("SocketLevel"), socket_level);
 	target->Set (String::NewSymbol ("SocketOption"), socket_option);
+	target->Set (String::NewSymbol ("Protocol"), protocols);
 
 	socket_level->Set (String::NewSymbol ("SOL_SOCKET"), Number::New (SOL_SOCKET));
 	socket_level->Set (String::NewSymbol ("IPPROTO_IP"), Number::New (IPPROTO_IP));
@@ -248,6 +255,7 @@ void ExportConstants (Handle<Object> target) {
 	socket_option->Set (String::NewSymbol ("SO_RCVTIMEO"), Number::New (SO_RCVTIMEO));
 	socket_option->Set (String::NewSymbol ("SO_SNDBUF"), Number::New (SO_SNDBUF));
 	socket_option->Set (String::NewSymbol ("SO_SNDTIMEO"), Number::New (SO_SNDTIMEO));
+	socket_option->Set (String::NewSymbol ("SO_DONTROUTE"), Number::New (SO_DONTROUTE));
 
 	socket_option->Set (String::NewSymbol ("IP_HDRINCL"), Number::New (IP_HDRINCL));
 	socket_option->Set (String::NewSymbol ("IP_OPTIONS"), Number::New (IP_OPTIONS));
@@ -260,6 +268,8 @@ void ExportConstants (Handle<Object> target) {
 	socket_option->Set (String::NewSymbol ("IPV6_TTL"), Number::New (IPV6_UNICAST_HOPS));
 	socket_option->Set (String::NewSymbol ("IPV6_UNICAST_HOPS"), Number::New (IPV6_UNICAST_HOPS));
 	socket_option->Set (String::NewSymbol ("IPV6_V6ONLY"), Number::New (IPV6_V6ONLY));
+
+	protocols->Set (String::NewSymbol ("ETH_P_ALL"), Number::New (htons(ETH_P_ALL)));
 }
 
 void ExportFunctions (Handle<Object> target) {
@@ -285,6 +295,7 @@ void SocketWrap::Init (Handle<Object> target) {
 	NODE_SET_PROTOTYPE_METHOD(tpl, "recv", Recv);
 	NODE_SET_PROTOTYPE_METHOD(tpl, "send", Send);
 	NODE_SET_PROTOTYPE_METHOD(tpl, "setOption", SetOption);
+	NODE_SET_PROTOTYPE_METHOD(tpl, "bindToDevice", BindToDevice);
 
 	target->Set (String::NewSymbol ("SocketWrap"), tpl->GetFunction ());
 }
@@ -468,8 +479,10 @@ Handle<Value> SocketWrap::New (const Arguments& args) {
 					"Address family argument must be an unsigned integer")));
 			return scope.Close (args.This ());
 		} else {
-			if (args[1]->ToUint32 ()->Value () == 2)
-				family = AF_INET6;
+			switch (args[1]->ToUint32 ()->Value ()) {
+				case 2: family = AF_INET6; break;
+				case 3: family = AF_PACKET; break;
+			}
 		}
 	}
 	
@@ -543,9 +556,11 @@ Handle<Value> SocketWrap::Recv (const Arguments& args) {
 			? sizeof (sin6_address)
 			: sizeof (sin_address);
 #else
-	socklen_t sin_length = socket->family_ == AF_INET6
-			? sizeof (sin6_address)
-			: sizeof (sin_address);
+	socklen_t sin_length;
+	switch(socket->family_) {
+		case AF_INET6: sin_length = sizeof (sin6_address); break;
+		case AF_INET: sin_length = sizeof (sin_address); break;
+	}
 #endif
 	
 	if (args.Length () < 2) {
@@ -574,16 +589,23 @@ Handle<Value> SocketWrap::Recv (const Arguments& args) {
 		return scope.Close (args.This ());
 	}
 
-	if (socket->family_ == AF_INET6) {
-		memset (&sin6_address, 0, sizeof (sin6_address));
-		rc = recvfrom (socket->poll_fd_, node::Buffer::Data (buffer),
-				(int) node::Buffer::Length (buffer), 0, (sockaddr *) &sin6_address,
-				&sin_length);
-	} else {
-		memset (&sin_address, 0, sizeof (sin_address));
-		rc = recvfrom (socket->poll_fd_, node::Buffer::Data (buffer),
-				(int) node::Buffer::Length (buffer), 0, (sockaddr *) &sin_address,
-				&sin_length);
+	switch (socket->family_) {
+		case AF_INET6:
+			memset (&sin6_address, 0, sizeof (sin6_address));
+			rc = recvfrom (socket->poll_fd_, node::Buffer::Data (buffer),
+					(int) node::Buffer::Length (buffer), 0, (sockaddr *) &sin6_address,
+					&sin_length);
+			break;
+		case AF_INET:
+			memset (&sin_address, 0, sizeof (sin_address));
+			rc = recvfrom (socket->poll_fd_, node::Buffer::Data (buffer),
+					(int) node::Buffer::Length (buffer), 0, (sockaddr *) &sin_address,
+					&sin_length);
+			break;
+		case AF_PACKET:
+			rc = recv (socket->poll_fd_, node::Buffer::Data (buffer),
+					(int) node::Buffer::Length (buffer), 0);
+			break;
 	}
 	
 	if (rc == SOCKET_ERROR) {
@@ -592,17 +614,17 @@ Handle<Value> SocketWrap::Recv (const Arguments& args) {
 		return scope.Close (args.This ());
 	}
 	
-	if (socket->family_ == AF_INET6)
-		uv_ip6_name (&sin6_address, addr, 50);
-	else
-		uv_ip4_name (&sin_address, addr, 50);
-	
+	switch (socket->family_) {
+		case AF_INET6: uv_ip6_name (&sin6_address, addr, 50); break;
+		case AF_INET: uv_ip4_name (&sin_address, addr, 50); break;
+	}
+
 	Local<Function> cb = Local<Function>::Cast (args[1]);
 	const unsigned argc = 3;
-	Local<Value> argv[argc];
+	Handle<Value> argv[argc];
 	argv[0] = args[0];
 	argv[1] = Number::New (rc);
-	argv[2] = String::New (addr);
+	argv[2] = socket->family_ != AF_PACKET ? String::New (addr) : Undefined();
 	cb->Call (Context::GetCurrent ()->Global (), argc, argv);
 	
 	return scope.Close (args.This ());
@@ -641,7 +663,7 @@ Handle<Value> SocketWrap::Send (const Arguments& args) {
 		return scope.Close (args.This ());
 	}
 
-	if (! args[3]->IsString ()) {
+	if (!(socket->family_ == AF_PACKET || args[3]->IsString())) {
 		ThrowException (Exception::TypeError (String::New (
 				"Address argument must be a string")));
 		return scope.Close (args.This ());
@@ -663,17 +685,32 @@ Handle<Value> SocketWrap::Send (const Arguments& args) {
 	offset = args[1]->ToUint32 ()->Value ();
 	length = args[2]->ToUint32 ()->Value ();
 	String::AsciiValue address (args[3]);
+	struct sockaddr_in6 addr6;
+	struct sockaddr_in addr4;
+	struct sockaddr_ll addr;
 
 	data = node::Buffer::Data (buffer) + offset;
 	
-	if (socket->family_ == AF_INET6) {
-		struct sockaddr_in6 addr = uv_ip6_addr (*address, 0);
-		rc = sendto (socket->poll_fd_, data, length, 0,
-				(struct sockaddr *) &addr, sizeof (addr));
-	} else {
-		struct sockaddr_in addr = uv_ip4_addr (*address, 0);
-		rc = sendto (socket->poll_fd_, data, length, 0,
-				(struct sockaddr *) &addr, sizeof (addr));
+	switch (socket->family_) {
+		case AF_INET6:
+			addr6 = uv_ip6_addr (*address, 0);
+			rc = sendto (socket->poll_fd_, data, length, 0,
+					(struct sockaddr *) &addr6, sizeof (addr6));
+			break;
+		case AF_INET:
+			addr4 = uv_ip4_addr (*address, 0);
+			rc = sendto (socket->poll_fd_, data, length, 0,
+					(struct sockaddr *) &addr4, sizeof (addr4));
+			break;
+		case AF_PACKET:
+			addr.sll_family = socket->family_;
+			addr.sll_protocol = socket->protocol_;
+			addr.sll_ifindex = socket->ifindex_;
+			addr.sll_halen = ETHER_ADDR_LEN;
+			memcpy(addr.sll_addr,data,ETHER_ADDR_LEN);
+			rc = sendto (socket->poll_fd_, data, length, 0,
+					(struct sockaddr *) &addr, sizeof (addr));
+			break;
 	}
 	
 	if (rc == SOCKET_ERROR) {
@@ -764,6 +801,44 @@ Handle<Value> SocketWrap::SetOption (const Arguments& args) {
 	}
 	
 	return scope.Close (args.This ());
+}
+
+Handle<Value> SocketWrap::BindToDevice (const Arguments& args) {
+	HandleScope scope;
+	SocketWrap* socket = SocketWrap::Unwrap<SocketWrap> (args.This ());
+
+	if (!(args.Length() == 1 && args[0]->IsString())) {
+			ThrowException (Exception::TypeError (String::New (
+					"Only argument must be an ethernet device")));
+			return scope.Close (args.This ());		
+	}
+
+	String::AsciiValue device(args[0]);
+	char* device_ascii = new char[IFNAMSIZ];
+	strcpy(device_ascii, *device);
+
+  struct sockaddr_ll sll;
+  struct ifreq ifr;
+  bzero(&sll , sizeof(sll));
+  bzero(&ifr , sizeof(ifr)); 
+  strncpy((char *)ifr.ifr_name, device_ascii, IFNAMSIZ); 
+  //copy device name to ifr 
+  if((ioctl(socket->poll_fd_, SIOCGIFINDEX , &ifr)) == -1) {
+		ThrowException (Exception::Error (String::New (
+				raw_strerror (SOCKET_ERRNO))));
+		return scope.Close (args.This ());
+  }
+  sll.sll_family = socket->family_; 
+  sll.sll_ifindex = ifr.ifr_ifindex; 
+  sll.sll_protocol = socket->protocol_; 
+  if((bind(socket->poll_fd_, (struct sockaddr *)&sll , sizeof(sll))) ==-1) {
+		ThrowException (Exception::Error (String::New (
+				raw_strerror (SOCKET_ERRNO))));
+		return scope.Close (args.This ());
+  }
+  socket->ifindex_ = ifr.ifr_ifindex;
+
+	return scope.Close (args.This ());	
 }
 
 static void IoEvent (uv_poll_t* watcher, int status, int revents) {

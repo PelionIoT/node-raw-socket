@@ -12,9 +12,14 @@ function _expandConstantObject (object) {
 		object[object[keys[i]]] = parseInt (keys[i]);
 }
 
+function _mergeConstantObjects(src, dst) {
+	for (key in src) dst[key] = src[key];
+}
+
 var AddressFamily = {
 	1: "IPv4",
-	2: "IPv6"
+	2: "IPv6",
+	3: "Packet"
 };
 
 _expandConstantObject (AddressFamily);
@@ -26,7 +31,7 @@ var Protocol = {
 	17: "UDP",
 	58: "ICMPv6"
 };
-
+_mergeConstantObjects(raw.Protocol, Protocol);
 _expandConstantObject (Protocol);
 
 for (var key in events.EventEmitter.prototype) {
@@ -44,14 +49,10 @@ function Socket (options) {
 	this.recvPaused = false;
 	this.sendPaused = true;
 
-	this.wrap = new raw.SocketWrap (
-			((options && options.protocol)
-					? options.protocol
-					: 0),
-			((options && options.addressFamily)
-					? options.addressFamily
-					: AddressFamily.IPv4)
-		);
+	this.protocol = options.protocol || 0;
+	this.addressFamily = options.addressFamily || AddressFamily.IPv4;
+
+	this.wrap = new raw.SocketWrap(this.protocol, this.addressFamily);
 
 	var me = this;
 	this.wrap.on ("sendReady", this.onSendReady.bind (me));
@@ -107,8 +108,8 @@ Socket.prototype.onSendReady = function () {
 			req.afterCallback.call (me, error, 0);
 		}
 	} else {
-		if (! this.sendPaused)
-			this.pauseSend ();
+		//if (! this.sendPaused)
+			//this.pauseSend ();
 	}
 }
 
@@ -150,7 +151,7 @@ Socket.prototype.send = function (buffer, offset, length, address,
 		return this;
 	}
 
-	if (! net.isIP (address)) {
+	if (!(this.addressFamily == AddressFamily.Packet || net.isIP(address))) {
 		afterCallback.call (this, new Error ("Invalid IP address '" + address + "'"));
 		return this;
 	}
@@ -176,6 +177,10 @@ Socket.prototype.setOption = function (level, option, value, length) {
 		this.wrap.setOption (level, option, value, length);
 	else
 		this.wrap.setOption (level, option, value);
+}
+
+Socket.prototype.bindToDevice = function(device) {
+	this.wrap.bindToDevice(device);
 }
 
 exports.createChecksum = function () {

@@ -82,6 +82,7 @@ private:
 	static Handle<Value> Recv (const Arguments& args);
 	static Handle<Value> Send (const Arguments& args);
 	static Handle<Value> SetOption (const Arguments& args);
+	static Handle<Value> BindToDevice(const Arguments& args);
 
 	bool no_ip_header_;
 
@@ -93,6 +94,8 @@ private:
 	bool poll_initialised_;
 	
 	bool deconstructing_;
+
+	int ifindex_;
 };
 
 static void IoEvent (uv_poll_t* watcher, int status, int revents);
